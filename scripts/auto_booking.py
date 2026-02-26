@@ -47,7 +47,7 @@ def run_setup():
     print("Credentials will be saved to ~/.xmu_booking.json")
     print("(readable only by you, never uploaded anywhere)\n")
 
-    username = input("Campus ID (e.g. CYS2309205): ").strip()
+    username = input("Campus ID: ").strip()
     password = getpass.getpass("Password: ")
     if not username or not password:
         print("✗ Username and password cannot be empty.")

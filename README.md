@@ -35,7 +35,7 @@ python3 scripts/auto_booking.py --setup
 ```
 
 会依次提示输入：
-- Campus ID（学号，如 `CYS2309205`）
+- Campus ID（学号）
 - 密码
 - Gemini API Key（粘贴上一步申请的 Key）
 
