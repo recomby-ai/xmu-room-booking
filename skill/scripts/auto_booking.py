@@ -24,12 +24,48 @@ import sys
 import json
 import getpass
 
-# ── Config file path ──────────────────────────────────────────────────────────
-CONFIG_PATH = os.path.expanduser("~/.xmu_booking.json")
-BUILTIN_GEMINI_KEY = ""  # Get your free key at https://aistudio.google.com/apikey
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_PATH      = os.path.expanduser("~/.xmu_booking.json")
+BUILTIN_GEMINI_KEY = ""  # Get your free key: https://aistudio.google.com/apikey
+BASE_URL         = "https://eservices.xmu.edu.my"
+
+# ── Room type table IDs ───────────────────────────────────────────────────────
+ROOM_TABLE_IDS = {
+    "silent":  "silent_study_room_table",       # N201-N214  cap 2  L2
+    "study":   "study_room_table",              # S221-S234  cap 2  L2
+    "group":   "group_discussion_room_table",   # E231-E236, W241-W246  cap 4  L2
+    "success": "student_success_room_table",    # Room 1-3   cap 4/10  L3
+}
+
+# ── Available time slots (both weekday and weekend share the same 2-hr slots) ─
+# Weekday:  09:00-11:00  11:00-13:00  13:00-15:00  15:00-17:00  17:00-19:00  19:00-21:00
+# Weekend:  09:00-11:00  11:00-13:00  13:00-15:00  15:00-17:00
+VALID_SLOTS = [
+    ("09:00", "11:00"),
+    ("11:00", "13:00"),
+    ("13:00", "15:00"),
+    ("15:00", "17:00"),
+    ("17:00", "19:00"),  # weekday only
+    ("19:00", "21:00"),  # weekday only
+]
+
+# Default preferences (tried in order, first available wins)
+DEFAULT_WEEKDAY_TIMES = ["19:00-21:00", "17:00-19:00", "15:00-17:00"]
+DEFAULT_WEEKEND_TIMES = ["15:00-17:00", "13:00-15:00", "11:00-13:00"]
+
+
+def parse_time_slots(time_str):
+    """Parse comma-separated 'HH:MM-HH:MM' into list of (start, end) tuples."""
+    slots = []
+    for s in time_str.split(","):
+        s = s.strip()
+        parts = s.split("-")
+        if len(parts) == 2:
+            slots.append((parts[0].strip(), parts[1].strip()))
+    return slots
+
 
 def load_config():
-    """Load saved credentials from config file."""
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f:
@@ -40,7 +76,6 @@ def load_config():
 
 
 def run_setup():
-    """Interactive first-time credential setup."""
     print("=" * 60)
     print("XMUM Booking — First-time Setup")
     print("=" * 60)
@@ -53,12 +88,10 @@ def run_setup():
         print("✗ Username and password cannot be empty.")
         sys.exit(1)
 
-    gemini_key = input(
-        f"Gemini API Key [press Enter to use built-in key]: "
-    ).strip()
+    gemini_key = input("Gemini API Key (https://aistudio.google.com/apikey): ").strip()
     if not gemini_key:
-        gemini_key = BUILTIN_GEMINI_KEY
-        print("  → Using built-in Gemini API Key")
+        print("✗ Gemini API Key is required for captcha recognition.")
+        sys.exit(1)
 
     config = {"username": username, "password": password, "gemini_key": gemini_key}
     with open(CONFIG_PATH, "w") as f:
@@ -69,27 +102,12 @@ def run_setup():
     print("  python3 auto_booking.py")
     sys.exit(0)
 
-# ── Load credentials (env vars override config file) ─────────────────────────
-_cfg = load_config()
+
+# ── Load credentials ──────────────────────────────────────────────────────────
+_cfg           = load_config()
 GEMINI_API_KEY = os.environ.get("XMUM_GEMINI_KEY") or _cfg.get("gemini_key") or BUILTIN_GEMINI_KEY
 USERNAME       = os.environ.get("XMUM_USERNAME")   or _cfg.get("username", "")
 PASSWORD       = os.environ.get("XMUM_PASSWORD")   or _cfg.get("password", "")
-
-BASE_URL = "https://eservices.xmu.edu.my"
-
-# ── Room type table IDs ───────────────────────────────────────────────────────
-ROOM_TABLE_IDS = {
-    "silent":  "silent_study_room_table",       # Silent Study Rooms    N201-N214 (cap 2)
-    "study":   "study_room_table",              # Study Rooms           S221-S234 (cap 2)
-    "group":   "group_discussion_room_table",   # Group Discussion Rooms E231-E236, W241-W246 (cap 4)
-    "success": "student_success_room_table",    # Student Success Rooms  Room 1-3 (cap 4/10)
-}
-
-# ── Default booking times ─────────────────────────────────────────────────────
-WEEKDAY_START = "19:00"
-WEEKDAY_END   = "21:00"
-WEEKEND_START = "15:00"
-WEEKEND_END   = "17:00"
 
 
 def check_credentials():
@@ -98,9 +116,11 @@ def check_credentials():
         missing.append("XMUM_USERNAME")
     if not PASSWORD:
         missing.append("XMUM_PASSWORD")
+    if not GEMINI_API_KEY:
+        missing.append("XMUM_GEMINI_KEY")
     if missing:
-        print("✗ Missing environment variables:", ", ".join(missing))
-        print("  See SETUP.md for configuration instructions.")
+        print("✗ Missing credentials:", ", ".join(missing))
+        print("  Run: python3 auto_booking.py --setup")
         sys.exit(1)
 
 
@@ -109,9 +129,9 @@ def recognize_captcha(image_content):
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel("gemini-flash-latest")
         img = Image.open(io.BytesIO(image_content))
-        prompt = ("Please analyze this CAPTCHA image and return ONLY the "
-                  "text/characters you see. No explanations, just the characters.")
-        response = model.generate_content([prompt, img])
+        response = model.generate_content(
+            ["Return ONLY the captcha characters, no explanations.", img]
+        )
         return response.text.strip()
     except Exception as e:
         print(f"✗ Captcha recognition error: {e}")
@@ -146,40 +166,28 @@ def login(session):
         print("\n[3/4] Recognizing captcha with Gemini API...")
         captcha_text = recognize_captcha(captcha_response.content)
         if not captcha_text:
-            print("✗ Failed to recognize captcha")
             return False
         print(f"✓ Captcha recognized: {captcha_text}")
 
         print("\n[4/4] Submitting login credentials...")
         csrf_input = soup.find("input", {"name": "_token"})
-        login_data = {
-            "campus-id": USERNAME,
-            "password":  PASSWORD,
-            "captcha":   captcha_text,
-        }
+        login_data = {"campus-id": USERNAME, "password": PASSWORD, "captcha": captcha_text}
         if csrf_input:
             login_data["_token"] = csrf_input.get("value")
 
-        login_response = session.post(
-            BASE_URL + "/authenticate",
-            data=login_data,
-            timeout=10,
-            allow_redirects=True,
-        )
+        r = session.post(BASE_URL + "/authenticate", data=login_data,
+                         timeout=10, allow_redirects=True)
 
-        if "logout" in login_response.text.lower() or "dashboard" in login_response.text.lower():
+        if "logout" in r.text.lower() or "dashboard" in r.text.lower():
             print("✓ Login successful!")
             return True
-        elif "captcha" in login_response.text.lower() and "incorrect" in login_response.text.lower():
+        elif "captcha" in r.text.lower() and "incorrect" in r.text.lower():
             print("✗ Incorrect captcha")
-            return False
-        elif "password" in login_response.text.lower() and "incorrect" in login_response.text.lower():
+        elif "password" in r.text.lower() and "incorrect" in r.text.lower():
             print("✗ Incorrect username or password")
-            return False
         else:
-            print("✗ Login failed (unknown reason)")
-            print("  Response URL:", login_response.url)
-            return False
+            print("✗ Login failed  URL:", r.url)
+        return False
 
     except Exception as e:
         print(f"✗ Login error: {e}")
@@ -188,9 +196,7 @@ def login(session):
 
 def extract_csrf_token(session):
     try:
-        response = session.get(
-            BASE_URL + "/space-booking/library-space-booking", timeout=10
-        )
+        response = session.get(BASE_URL + "/space-booking/library-space-booking", timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
         meta = soup.find("meta", {"name": "csrf-token"})
         if meta:
@@ -205,53 +211,42 @@ def extract_csrf_token(session):
 
 
 def get_available_rooms(session, booking_date, csrf_token,
-                        room_type="group", any_time=False,
-                        target_start=None, target_end=None):
+                        room_type="group", target_start=None, target_end=None):
+    """
+    Return available rooms for the given date.
+    If target_start/end is None, return ALL available rooms (any time).
+    """
     table_id = ROOM_TABLE_IDS.get(room_type, ROOM_TABLE_IDS["group"])
     try:
         response = session.get(
             BASE_URL + "/space-booking/library-space-booking",
             params={"bookingDate": booking_date},
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "X-CSRF-TOKEN": csrf_token,
-            },
+            headers={"X-Requested-With": "XMLHttpRequest", "X-CSRF-TOKEN": csrf_token},
             timeout=10,
         )
         response.raise_for_status()
-        data = response.json()
-        soup = BeautifulSoup(data.get("html", ""), "html.parser")
+        soup = BeautifulSoup(response.json().get("html", ""), "html.parser")
 
         table = soup.find("table", {"id": table_id})
         if not table:
-            print(f"  ✗ Room table '{table_id}' not found in response")
+            print(f"  ✗ Table '{table_id}' not found")
             return []
 
-        available, all_slots = [], []
+        available = []
         for btn in table.find_all("button", class_="booking-btn"):
             if btn.has_attr("disabled"):
                 continue
             info = {
-                "room_id":   btn.get("data-booking-room-id"),
-                "room_name": btn.get("data-booking-room-name"),
+                "room_id":    btn.get("data-booking-room-id"),
+                "room_name":  btn.get("data-booking-room-name"),
                 "start_time": btn.get("data-booking-start-time"),
                 "end_time":   btn.get("data-booking-end-time"),
                 "date":       btn.get("data-booking-date"),
             }
-            all_slots.append(f"{info['room_name']} ({info['start_time']}-{info['end_time']})")
-            if any_time:
+            if target_start is None:  # any time
                 available.append(info)
-                print(f"  ✓ Available: {info['room_name']} ({info['start_time']}-{info['end_time']})")
             elif info["start_time"] == target_start and info["end_time"] == target_end:
                 available.append(info)
-                print(f"  ✓ Target slot: {info['room_name']} ({info['start_time']}-{info['end_time']})")
-
-        if not available and not any_time and all_slots:
-            print(f"  ℹ No {target_start}-{target_end} slots. Available ({len(all_slots)}):")
-            for s in all_slots[:5]:
-                print(f"     - {s}")
-            if len(all_slots) > 5:
-                print(f"     ... and {len(all_slots) - 5} more")
 
         return available
 
@@ -262,7 +257,7 @@ def get_available_rooms(session, booking_date, csrf_token,
 
 def book_room(session, room_info, csrf_token):
     try:
-        response = session.post(
+        r = session.post(
             BASE_URL + "/space-booking/book-library-room",
             data={
                 "_token":           csrf_token,
@@ -271,31 +266,29 @@ def book_room(session, room_info, csrf_token):
                 "bookingStartTime": room_info["start_time"],
                 "bookingEndTime":   room_info["end_time"],
             },
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "X-CSRF-TOKEN": csrf_token,
-            },
+            headers={"X-Requested-With": "XMLHttpRequest", "X-CSRF-TOKEN": csrf_token},
             timeout=10,
         )
-        response.raise_for_status()
-        result = response.json()
-
-        print(f"  [*] Booking: {room_info['room_name']}  {room_info['date']}  "
+        r.raise_for_status()
+        result = r.json()
+        print(f"  [*] {room_info['room_name']}  {room_info['date']}  "
               f"{room_info['start_time']}-{room_info['end_time']}")
-
         if result.get("code") == 200:
-            print(f"  ✓ Booking successful! {result.get('message', '')}")
+            print(f"  ✓ Booking successful!")
             return True
         else:
-            print(f"  ✗ Booking failed: {result.get('message', 'Unknown error')}")
+            print(f"  ✗ {result.get('message', 'Unknown error')}")
             return False
-
     except Exception as e:
         print(f"  ✗ Error booking room: {e}")
         return False
 
 
-def book_rooms(session, target_date=None, any_time=False, room_type="group"):
+def book_rooms(session, target_date=None, time_prefs=None, room_type="group"):
+    """
+    time_prefs: list of (start, end) tuples tried in order.
+                None means try ALL available slots (any time).
+    """
     print("\n" + "=" * 60)
     print("Starting room booking process...")
     print("=" * 60)
@@ -306,71 +299,80 @@ def book_rooms(session, target_date=None, any_time=False, room_type="group"):
         return False
     print("✓ CSRF token obtained")
 
-    # Determine dates
     if target_date:
         try:
             booking_date = datetime.strptime(target_date, "%Y-%m-%d")
             dates_to_book = [booking_date]
-            print(f"\n[*] Booking for specified date: {target_date} (any available time)")
+            print(f"\n[*] Booking for specified date: {target_date}")
         except ValueError:
             print(f"✗ Invalid date format: {target_date}. Use YYYY-MM-DD")
             return False
     else:
-        today = datetime.now()
-        booking_date = today + timedelta(days=2)
+        booking_date = datetime.now() + timedelta(days=2)
         dates_to_book = [booking_date]
         day_type = "weekday" if booking_date.weekday() < 5 else "weekend"
-        print(f"\n[*] Auto mode: booking for {booking_date.strftime('%Y-%m-%d, %A')} ({day_type})")
+        print(f"\n[*] Auto mode: {booking_date.strftime('%Y-%m-%d, %A')} ({day_type})")
 
     results = []
     for bd in dates_to_book:
-        date_str  = bd.strftime("%Y-%m-%d")
-        day_name  = bd.strftime("%A")
+        date_str   = bd.strftime("%Y-%m-%d")
+        day_name   = bd.strftime("%A")
         is_weekend = bd.weekday() >= 5
 
         print(f"\n{'=' * 60}")
-        print(f"Processing {day_name}, {date_str}  [room type: {room_type}]")
+        print(f"{day_name}, {date_str}  [room: {room_type}]")
         print(f"{'=' * 60}")
 
-        if any_time:
-            t_start, t_end = None, None
+        # Determine time preference list for this day
+        if time_prefs is not None:
+            slots_to_try = time_prefs  # user-specified
         elif is_weekend:
-            t_start, t_end = WEEKEND_START, WEEKEND_END
-            print(f"  Time target: {t_start}-{t_end} (weekend)")
+            slots_to_try = parse_time_slots(",".join(DEFAULT_WEEKEND_TIMES))
         else:
-            t_start, t_end = WEEKDAY_START, WEEKDAY_END
-            print(f"  Time target: {t_start}-{t_end} (weekday)")
+            slots_to_try = parse_time_slots(",".join(DEFAULT_WEEKDAY_TIMES))
 
-        rooms = get_available_rooms(
-            session, date_str, csrf_token,
-            room_type=room_type, any_time=any_time,
-            target_start=t_start, target_end=t_end,
-        )
+        any_time = (slots_to_try == [])
 
-        if rooms:
-            label = f"{len(rooms)} room(s)" + (f" for {t_start}-{t_end}" if not any_time else "")
-            print(f"  ✓ Found {label}")
-            success = book_room(session, rooms[0], csrf_token)
-            results.append({"date": date_str, "day": day_name,
-                            "status": "success" if success else "failed",
-                            "room": rooms[0]["room_name"] if success else None})
-            time.sleep(2)
+        if any_time:
+            print("  Time: any available slot")
         else:
-            print(f"  ✗ No available rooms found")
-            results.append({"date": date_str, "day": day_name,
-                            "status": "no_rooms", "room": None})
+            prefs_str = ", ".join(f"{s}-{e}" for s, e in slots_to_try)
+            print(f"  Time preference: {prefs_str}")
+
+        booked = False
+        if any_time:
+            rooms = get_available_rooms(session, date_str, csrf_token, room_type=room_type)
+            if rooms:
+                booked = book_room(session, rooms[0], csrf_token)
+        else:
+            for t_start, t_end in slots_to_try:
+                rooms = get_available_rooms(session, date_str, csrf_token,
+                                            room_type=room_type,
+                                            target_start=t_start, target_end=t_end)
+                if rooms:
+                    print(f"  ✓ Found {len(rooms)} room(s) for {t_start}-{t_end}")
+                    booked = book_room(session, rooms[0], csrf_token)
+                    break
+                else:
+                    print(f"  ○ No rooms for {t_start}-{t_end}, trying next...")
+
+        results.append({
+            "date": date_str, "day": day_name,
+            "status": "success" if booked else ("failed" if any([
+                get_available_rooms(session, date_str, csrf_token, room_type=room_type,
+                                    target_start=s, target_end=e)
+                for s, e in (slots_to_try or [])
+            ]) else "no_rooms"),
+            "room": None
+        })
         time.sleep(1)
 
     print(f"\n{'=' * 60}")
     print("BOOKING SUMMARY")
     print(f"{'=' * 60}")
     for r in results:
-        if r["status"] == "success":
-            print(f"✓ {r['day']}, {r['date']}: BOOKED → {r['room']}")
-        elif r["status"] == "no_rooms":
-            print(f"○ {r['day']}, {r['date']}: NO AVAILABLE ROOMS")
-        else:
-            print(f"✗ {r['day']}, {r['date']}: FAILED")
+        icon = "✓" if r["status"] == "success" else ("○" if r["status"] == "no_rooms" else "✗")
+        print(f"{icon} {r['day']}, {r['date']}: {r['status'].upper()}")
 
     return True
 
@@ -379,46 +381,51 @@ def main():
     parser = argparse.ArgumentParser(
         description="XMUM Auto Booking — books library rooms automatically"
     )
-    parser.add_argument(
-        "--setup", action="store_true",
-        help="First-time setup: save your campus ID and password locally.",
-    )
-    parser.add_argument(
-        "--date",
-        help="Book a specific date (YYYY-MM-DD). Books ANY available slot.",
-    )
-    parser.add_argument(
-        "--room-type",
-        choices=list(ROOM_TABLE_IDS.keys()),
-        default="group",
-        help=f"Room type to book. Options: {list(ROOM_TABLE_IDS.keys())}. Default: group",
-    )
+    parser.add_argument("--setup", action="store_true",
+                        help="First-time setup: save credentials locally.")
+    parser.add_argument("--date",
+                        help="Book a specific date (YYYY-MM-DD).")
+    parser.add_argument("--room-type", choices=list(ROOM_TABLE_IDS.keys()), default="group",
+                        help="Room type. Options: silent, study, group (default), success")
+    parser.add_argument("--time",
+                        help=(
+                            "Comma-separated time preferences in order, e.g. '19:00-21:00,17:00-19:00'. "
+                            "Script tries each slot in order until one is available. "
+                            f"Weekday default: {','.join(DEFAULT_WEEKDAY_TIMES)}  "
+                            f"Weekend default: {','.join(DEFAULT_WEEKEND_TIMES)}"
+                        ))
     args = parser.parse_args()
 
     if args.setup:
-        run_setup()  # exits after saving
+        run_setup()
 
     check_credentials()
 
     print("\n")
     print("╔" + "=" * 58 + "╗")
-    print("║" + " " * 15 + "XMUM Auto Booking System" + " " * 20 + "║")
+    print("║" + " " * 14 + "XMUM Auto Booking System" + " " * 20 + "║")
     print("╚" + "=" * 58 + "╝")
-    print()
-    print(f"User:      {USERNAME}")
+    print(f"\nUser:      {USERNAME}")
     print(f"Room type: {args.room_type}")
-    if args.date:
+
+    # Resolve time preferences
+    if args.time:
+        time_prefs = parse_time_slots(args.time)
+        print(f"Time pref: {args.time}")
+        any_time_mode = False
+    elif args.date:
+        time_prefs = []  # any time when date is manually specified
         print(f"Mode:      Manual → {args.date} (any available time)")
         any_time_mode = True
     else:
+        time_prefs = None  # use day-based defaults
         print(f"Mode:      Auto (2 days from now)")
-        print(f"           Weekday {WEEKDAY_START}-{WEEKDAY_END} / Weekend {WEEKEND_START}-{WEEKEND_END}")
+        print(f"           Weekday default: {', '.join(DEFAULT_WEEKDAY_TIMES)}")
+        print(f"           Weekend default: {', '.join(DEFAULT_WEEKEND_TIMES)}")
         any_time_mode = False
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
     for attempt in range(1, 4):
         print(f"\nLogin attempt {attempt}/3")
@@ -431,8 +438,10 @@ def main():
         print("\n✗ Failed to login after 3 attempts")
         sys.exit(1)
 
-    book_rooms(session, target_date=args.date,
-               any_time=any_time_mode, room_type=args.room_type)
+    if any_time_mode:
+        book_rooms(session, target_date=args.date, time_prefs=[], room_type=args.room_type)
+    else:
+        book_rooms(session, target_date=args.date, time_prefs=time_prefs, room_type=args.room_type)
 
     print("\n" + "=" * 60)
     print("Session complete!")
